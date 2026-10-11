@@ -16,7 +16,12 @@ def tokenize(text: str) -> list[str]:
     return [token.lower() for token in TOKEN_PATTERN.findall(text)]
 
 
-def retrieve_chunks(query: str, chunks: list[PaperChunk], limit: int = 6) -> list[PaperChunk]:
+def retrieve_chunks(
+    query: str,
+    chunks: list[PaperChunk],
+    limit: int = 6,
+    max_per_page: int = 2,
+) -> list[PaperChunk]:
     if not chunks:
         return []
     query_tokens = tokenize(query)
@@ -43,8 +48,17 @@ def retrieve_chunks(query: str, chunks: list[PaperChunk], limit: int = 6) -> lis
         scored.append((score, -index, chunk))
 
     ranked = sorted(scored, reverse=True)
-    matches = [chunk for score, _, chunk in ranked if score > 0]
-    return (matches or chunks)[:limit]
+    candidates = [chunk for score, _, chunk in ranked if score > 0] or chunks
+    selected: list[PaperChunk] = []
+    page_counts: Counter[int] = Counter()
+    for chunk in candidates:
+        if page_counts[chunk.page_number] >= max_per_page:
+            continue
+        selected.append(chunk)
+        page_counts[chunk.page_number] += 1
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def select_analysis_chunks(chunks: list[PaperChunk], limit: int = 18) -> list[PaperChunk]:
