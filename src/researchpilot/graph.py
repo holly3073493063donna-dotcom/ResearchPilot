@@ -13,6 +13,8 @@ from researchpilot.models import (
     Evidence,
     PaperAnalysis,
     PaperChunk,
+    ReproductionItem,
+    ReproductionReadiness,
     ResearchMode,
     ResearchRequest,
 )
@@ -25,6 +27,7 @@ class ResearchState(TypedDict, total=False):
     context: list[PaperChunk]
     answer: AnswerResult
     analysis: PaperAnalysis
+    readiness: ReproductionReadiness
 
 
 def format_context(chunks: list[PaperChunk]) -> str:
@@ -130,11 +133,60 @@ def _parse_paper_analysis(content: object) -> PaperAnalysis:
         raise ValueError("模型返回的结构化分析不符合预期格式。") from exc
 
 
+def _parse_reproduction_readiness(content: object) -> ReproductionReadiness:
+    text = str(content).strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        text = "\n".join(lines[1:-1]).strip()
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end < start:
+        raise ValueError("模型未返回可解析的复现条件 JSON。")
+
+    try:
+        return ReproductionReadiness.model_validate_json(text[start : end + 1])
+    except ValueError as exc:
+        raise ValueError("模型返回的复现条件评估不符合预期格式。") from exc
+
+
+def _sanitize_reproduction_readiness(
+    readiness: ReproductionReadiness, chunks: list[PaperChunk]
+) -> ReproductionReadiness:
+    allowed_pages = {chunk.page_number for chunk in chunks}
+
+    def sanitize_items(items: list[ReproductionItem]) -> list[ReproductionItem]:
+        return [
+            item.model_copy(
+                update={"pages": sorted({page for page in item.pages if page in allowed_pages})}
+            )
+            for item in items
+        ]
+
+    return readiness.model_copy(
+        update={
+            "resources": sanitize_items(readiness.resources),
+            "environment": sanitize_items(readiness.environment),
+            "experiment": sanitize_items(readiness.experiment),
+            "blockers": sanitize_items(readiness.blockers),
+        }
+    )
+
+
 def build_research_graph(model: BaseChatModel):
     def retrieve(state: ResearchState) -> ResearchState:
         request = state["request"]
         if request.mode == ResearchMode.AUTOMATIC:
             context = select_analysis_chunks(state["chunks"])
+        elif request.mode == ResearchMode.REPRODUCTION:
+            query = (
+                "source code github repository dataset data availability implementation "
+                "dependencies environment hardware hyperparameters training evaluation metrics "
+                "supplementary material reproducibility"
+            )
+            primary = retrieve_chunks(query, state["chunks"], limit=12)
+            supplementary = select_analysis_chunks(state["chunks"], limit=12)
+            context = _merge_context(primary, supplementary, limit=20)
         else:
             expanded_query = _expand_search_query(model, request.question)
             primary = retrieve_chunks(expanded_query, state["chunks"], limit=8)
@@ -188,17 +240,58 @@ def build_research_graph(model: BaseChatModel):
         analysis = _parse_paper_analysis(response.content)
         return {"analysis": _sanitize_analysis(analysis, context)}
 
+    def assess_reproduction(state: ResearchState) -> ResearchState:
+        context = state["context"]
+        schema = json.dumps(ReproductionReadiness.model_json_schema(), ensure_ascii=False)
+        response = model.invoke(
+            [
+                SystemMessage(
+                    content=(
+                        "Assess reproduction readiness only from the supplied paper excerpts. "
+                        "Identify code, datasets, supplementary materials, dependencies, model "
+                        "checkpoints, hardware, parameters, training procedures, and evaluation "
+                        "metrics. Use evidence_type='paper' for statements directly supported by "
+                        "the paper and cite exact PDF pages. Use evidence_type='inference' only "
+                        "for cautious missing-or-unclear assessments and do not invent URLs, "
+                        "resources, commands, or results. Set approval_required=true for any later "
+                        "download or external action. Reply in concise Chinese. Return only one "
+                        "valid JSON object without Markdown fences or commentary. The JSON must "
+                        f"follow this schema exactly: {schema}"
+                    )
+                ),
+                HumanMessage(
+                    content=(
+                        "Create a reproduction-readiness assessment. Do not execute or download "
+                        f"anything.\n\n{format_context(context)}"
+                    )
+                ),
+            ]
+        )
+        readiness = _parse_reproduction_readiness(response.content)
+        return {"readiness": _sanitize_reproduction_readiness(readiness, context)}
+
     def route(state: ResearchState) -> str:
-        return "analyze" if state["request"].mode == ResearchMode.AUTOMATIC else "answer"
+        mode = state["request"].mode
+        if mode == ResearchMode.AUTOMATIC:
+            return "analyze"
+        if mode == ResearchMode.REPRODUCTION:
+            return "readiness"
+        return "answer"
 
     workflow = StateGraph(ResearchState)
     workflow.add_node("retrieve", retrieve)
     workflow.add_node("answer", answer_question)
     workflow.add_node("analyze", analyze_paper)
+    workflow.add_node("readiness", assess_reproduction)
     workflow.add_edge(START, "retrieve")
-    workflow.add_conditional_edges("retrieve", route, {"answer": "answer", "analyze": "analyze"})
+    workflow.add_conditional_edges(
+        "retrieve",
+        route,
+        {"answer": "answer", "analyze": "analyze", "readiness": "readiness"},
+    )
     workflow.add_edge("answer", END)
     workflow.add_edge("analyze", END)
+    workflow.add_edge("readiness", END)
     return workflow.compile()
 
 
