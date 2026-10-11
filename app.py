@@ -6,7 +6,13 @@ from dotenv import load_dotenv
 
 from researchpilot.graph import build_research_graph
 from researchpilot.llm import create_chat_model
-from researchpilot.models import PaperAnalysis, ResearchMode, ResearchRequest
+from researchpilot.models import (
+    EvidenceType,
+    PaperAnalysis,
+    ReproductionReadiness,
+    ResearchMode,
+    ResearchRequest,
+)
 from researchpilot.pdf import PdfError, chunk_pages, extract_pages
 
 load_dotenv()
@@ -43,6 +49,58 @@ def render_analysis(analysis: PaperAnalysis) -> None:
         st.caption("来源页码：" + "、".join(f"第 {page} 页" for page in item.pages))
 
 
+def render_readiness(readiness: ReproductionReadiness) -> None:
+    status_labels = {
+        "available": "可用",
+        "missing": "缺失",
+        "unclear": "不明确",
+        "not_applicable": "不适用",
+    }
+    st.subheader(readiness.title or "论文复现条件评估")
+    st.info(
+        f"总体状态：{status_labels[readiness.overall_status.value]}\n\n{readiness.summary}"
+    )
+
+    sections = [
+        ("资源与材料", readiness.resources),
+        ("环境与依赖", readiness.environment),
+        ("实验与指标", readiness.experiment),
+        ("当前阻碍", readiness.blockers),
+    ]
+    for heading, items in sections:
+        st.markdown(f"### {heading}")
+        if not items:
+            st.caption("论文摘录中没有识别到相关信息。")
+            continue
+        for item in items:
+            with st.container(border=True):
+                st.markdown(
+                    f"**{item.name}** · {status_labels[item.status.value]} · `{item.category}`"
+                )
+                st.write(item.details)
+                if item.url:
+                    st.code(item.url, language=None)
+                if item.pages:
+                    st.caption("来源页码：" + "、".join(f"第 {page} 页" for page in item.pages))
+                elif item.evidence_type == EvidenceType.INFERENCE:
+                    st.caption("系统推断：论文摘录中未找到明确依据。")
+                if item.approval_required:
+                    st.warning("后续如需访问或下载此资源，必须先获得你的确认。")
+
+    st.markdown("### 后续需审批的操作")
+    if readiness.approval_actions:
+        for action in readiness.approval_actions:
+            st.markdown(f"- {action}")
+    else:
+        st.caption("当前没有待审批操作。")
+
+    if readiness.caveats:
+        with st.expander("评估边界与注意事项"):
+            for caveat in readiness.caveats:
+                st.markdown(f"- {caveat}")
+    st.caption("本阶段只评估复现条件，不会下载文件、运行代码或声称复现成功。")
+
+
 with st.sidebar:
     st.header("模型设置")
     environment_key = os.getenv("OPENAI_API_KEY", "")
@@ -55,8 +113,9 @@ with st.sidebar:
     model_name = st.text_input("模型", value=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"))
     base_url = st.text_input("兼容 API 地址（可选）", value=os.getenv("OPENAI_BASE_URL", ""))
     st.divider()
-    st.caption("V1 已实现：PDF 文本提取、页码证据、论文问答、结构化分析。")
-    st.caption("尚未实现：OCR、算法复现、沙箱实验、结果验证、完整报告导出。")
+    st.caption("V1：PDF 文本提取、页码证据、论文问答、结构化分析。")
+    st.caption("V2 阶段 1：复现资源识别与条件评估，不执行下载或实验。")
+    st.caption("尚未实现：OCR、沙箱实验、结果验证、完整报告导出。")
 
 st.title("🔬 ResearchPilot")
 st.write("上传论文，获得可追溯到 PDF 页码的问答与结构化研究分析。")
@@ -87,9 +146,9 @@ if not api_key:
 
 mode_label = st.radio(
     "选择研究模式",
-    ["自动研究", "自定义研究"],
+    ["自动研究", "自定义研究", "复现评估"],
     horizontal=True,
-    help="自动研究生成标准结构化分析；自定义研究回答你的具体问题。",
+    help="自动研究生成结构化分析；自定义研究回答问题；复现评估检查代码、数据和实验条件。",
 )
 
 if mode_label == "自动研究":
@@ -97,6 +156,11 @@ if mode_label == "自动研究":
     run = st.button("开始自动分析", type="primary", disabled=not api_key)
     question = ""
     mode = ResearchMode.AUTOMATIC
+elif mode_label == "复现评估":
+    st.write("系统将识别代码、数据、环境、参数与指标，并列出缺失条件和待审批操作。")
+    run = st.button("开始复现条件评估", type="primary", disabled=not api_key)
+    question = ""
+    mode = ResearchMode.REPRODUCTION
 else:
     question = st.text_area(
         "你希望研究什么？",
@@ -118,6 +182,8 @@ if run:
             )
         if mode == ResearchMode.AUTOMATIC:
             render_analysis(result["analysis"])
+        elif mode == ResearchMode.REPRODUCTION:
+            render_readiness(result["readiness"])
         else:
             st.markdown("### 回答")
             st.write(result["answer"].answer)
@@ -134,4 +200,3 @@ with st.expander("后续能力路线图"):
     st.checkbox("在隔离沙箱中运行实验", disabled=True)
     st.checkbox("对照论文结果进行验证", disabled=True)
     st.checkbox("导出可复现研究报告", disabled=True)
-
